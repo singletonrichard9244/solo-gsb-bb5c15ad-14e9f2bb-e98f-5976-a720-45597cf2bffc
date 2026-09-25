@@ -28,6 +28,12 @@
 逐字来源，再在同一拼接文本中寻找两个**互不重叠的等长连续区间**：逐字相同或任一字为 `?` 即兼容，
 区间长度至少 **6** 且至少 **4** 个位置两侧已知字相同；按长度最长、同长度已知相同位更多、再按两起点
 升序取首对，返回两个左闭右开区间及各自原文与逐字 `sources`；无合格重复时 `repeat` 为 `null`。
+- **`POST /api/audit-omission`**：提交与 `/api/assemble` 相同的有序 `segments` 及一段独立参照转写
+`reference`（最长 **840** 字，须比拼接稿恰好多 **1～40** 字），复用拼接文本与逐字来源，只在
+**段间接缝**（左字含某原始段、右字不含该段而含更晚原始段的相邻位置）枚举补入参照稿连续缺文后两稿
+逐位对齐（相同字或任一侧 `?` 记 **0**、已知异字记 **1**，整稿异字数最多 **2**）的方案；唯一方案返回
+插入位置、缺文字串、异字数及接缝两侧 `sources`，不同缺文位置并列返回 **409**，无合格方案返回 **422**；
+结果仅供人工复核，**不改写拼接稿**。
 
 ## 快速开始
 
@@ -885,6 +891,135 @@ curl -X POST http://localhost:8000/api/find-repetition \
 
 续接失败、段数/长度不合法、缺字段时同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
 
+### `POST /api/audit-omission`
+
+供校勘人员以一份**独立参照转写**（如后世刻本）复核拼接稿在**段与段接缝处是否漏抄了连续文字**。
+请求的 `segments` 与 `/api/assemble` 完全相同（沿用 2～5 段、单段最长 500 字、总长最长 800 字的
+限制与续接门槛，续接失败同样返回 **422** 并给出 `failed_segment`），另附参照转写 `reference`
+（**1～840** 字，未辨认字也以 `?` 表示）。接口先复用 `/api/assemble` 得到拼接文本与逐字来源，再：
+
+- **只检查段间接缝**：枚举拼接文本相邻两字 `text[pos-1]` 与 `text[pos]` 之间，左字的逐字来源中含某
+  原始段 `k`、而右字来源不含 `k` 且含**更晚的原始段**（序号 > `k`）的位置（由较早段跨入更晚段的
+  接缝）；首尾位置不是接缝；
+- **长度前提**：参照稿须比拼接稿**恰好多 1～40 字**（`gap = len(reference) - len(text)`），等长、更短
+  或多逾 40 字均返回 **422**；
+- **枚举补字方案**：对每条接缝，把参照稿中占据补入位置的连续片段 `reference[pos:pos+gap]` 补入该接缝，
+  两稿即等长并**逐位对齐**：相同字、或任一侧为 `?` 记 **0**，双方皆为已知且异字记 **1**（补入片段与
+  参照稿同位文字逐字相同，不产生异字；异字只来自接缝前、后的逐位比较）；
+- **合格与择优**：仅接受整稿异字数不超过 **2** 的方案，取异字数最少者；
+- **不同缺文位置并列（409）**：多条不同接缝以同一最少异字数命中时返回 **409**，`detail.ties` 按插入
+  位置升序列出全部并列方案（各含 `pos`、`missing`、`diff` 及接缝两侧 `left`/`right`）；
+- **无合格方案（422）**：拼接文本中没有段间接缝、或所有接缝补入后异字数均超过 2 时返回 **422**。
+
+接口**只做审计提示，不改写拼接文本**；唯一方案返回的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` | 拼接文本（与 `/api/assemble` 一致，不被改写） |
+| `reference` | 原样回显的独立参照转写 |
+| `pos` | 缺文插入位置（拼接文本下标，从 0 开始）：补在 `text[pos-1]` 与 `text[pos]` 之间 |
+| `missing` | 建议补入的参照稿连续缺文字串 `reference[pos:pos+gap]`（1～40 字） |
+| `diff` | 补入后两稿逐位对齐的异字数（0～2） |
+| `left` | 接缝左侧相邻字 `text[pos-1]` 及其逐字 `sources`（含 `char` 与 `sources`） |
+| `right` | 接缝右侧相邻字 `text[pos]` 及其逐字 `sources`（含 `char` 与 `sources`） |
+
+请求体：
+
+```json
+{
+  "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+  "reference": "甲乙丙丁戊己X庚辛"
+}
+```
+
+- `segments`：必填，2～5 个非空字符串；单段最长 500 字，各段总长最长 800 字（同 `/api/assemble`）。
+- `reference`：必填，**1～840** 字的独立参照转写，须比拼接文本恰好多 1～40 字。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/audit-omission \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊己", "戊己庚辛"], "reference": "甲乙丙丁戊己X庚辛"}'
+```
+
+响应示例（拼接文本 `甲乙丙丁戊己庚辛` 共 8 字、参照 9 字；接缝位于 `己`(pos 5) 与 `庚`(pos 6) 之间，
+即段 0 跨入段 1 处，补入 `X` 后两稿逐位全同，`diff` 为 0）：
+
+```json
+{
+  "text": "甲乙丙丁戊己庚辛",
+  "reference": "甲乙丙丁戊己X庚辛",
+  "pos": 6,
+  "missing": "X",
+  "diff": 0,
+  "left": {
+    "char": "己",
+    "sources": [
+      { "segment": 0, "pos": 5 },
+      { "segment": 1, "pos": 1 }
+    ]
+  },
+  "right": {
+    "char": "庚",
+    "sources": [
+      { "segment": 1, "pos": 2 }
+    ]
+  }
+}
+```
+
+任一侧含 `?` 的字符对不记异字；接缝前后逐位比较中最多允许 2 处双方皆已知的异字。缺文多于 1 字时
+`missing` 为参照稿在该位置的连续片段，例如参照 `甲乙丙丁戊己XYZ庚辛`（多 3 字）时 `missing` 为 `XYZ`。
+
+**多个不同缺文位置并列（409）**示例——拼接文本 `AXCD`（segments `["AX", "AXC", "XCD"]`，接缝位于
+`X|C` 的 pos 2 与 `C|D` 的 pos 3），参照 `AXCCD` 中多出的 `C` 补在任一接缝都逐位相同，接口不擅自选择：
+
+```bash
+curl -X POST http://localhost:8000/api/audit-omission \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["AX", "AXC", "XCD"], "reference": "AXCCD"}'
+```
+
+```json
+{
+  "detail": {
+    "message": "参照稿的连续缺文可补入 2 个不同接缝且最少异字数同为 0，无法唯一确定缺文位置",
+    "diff": 0,
+    "ties": [
+      {
+        "pos": 2,
+        "missing": "C",
+        "diff": 0,
+        "left": { "char": "X", "sources": [ { "segment": 0, "pos": 1 }, { "segment": 1, "pos": 1 }, { "segment": 2, "pos": 0 } ] },
+        "right": { "char": "C", "sources": [ { "segment": 1, "pos": 2 }, { "segment": 2, "pos": 1 } ] }
+      },
+      {
+        "pos": 3,
+        "missing": "C",
+        "diff": 0,
+        "left": { "char": "C", "sources": [ { "segment": 1, "pos": 2 }, { "segment": 2, "pos": 1 } ] },
+        "right": { "char": "D", "sources": [ { "segment": 2, "pos": 2 } ] }
+      }
+    ]
+  }
+}
+```
+
+**无合格方案（422）**示例——参照与拼接稿在所有接缝补入后逐位异字都超过 2：
+
+```json
+{
+  "detail": {
+    "message": "全部 2 个段间接缝补入参照稿连续缺文后，整稿异字数均超过 2，无合格脱漏方案"
+  }
+}
+```
+
+拼接文本没有段间接缝（如两段完全重叠）、参照与拼接稿长度差不在 1～40 字、参照为空或超过 840 字、
+缺字段，或 segments 不满足 `/api/assemble` 的段数/长度限制、续接失败，同样返回 **422**
+（续接失败时给出 `failed_segment`，从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -920,6 +1055,11 @@ curl -X POST http://localhost:8000/api/find-repetition \
   规则），在同一份拼接文本中找两个互不重叠（允许贴合）的等长连续区间：对应字相同或任一字为 `?`
   即兼容，长度至少 6 且至少 4 个位置两侧已知字相同；取长度最长者，同长度取已知相同位更多者，再按
   两起点升序取首对，返回两个左闭右开区间及各自原文与逐字 sources；无合格重复时 `repeat` 为 `null`。
+- `/api/audit-omission` 复用 `/api/assemble` 的拼接文本与逐字来源（沿用段数/长度限制与续接失败
+  规则），只检查“左字含某原始段、右字不含该段而含更晚原始段”的相邻段间接缝；参照稿（≤840 字）须比
+  拼接稿恰好多 1～40 字。对每条接缝把参照稿同位连续片段补入后逐位对齐（相同字或任一侧 `?` 记 0、
+  已知异字记 1，整稿最多 2），取异字数最少的接缝：唯一接缝返回插入位置、缺文、异字数与接缝两侧
+  sources，不同缺文位置并列返回 **409**，无接缝或全部超 2 返回 **422**；只提示，不改写拼接稿。
 
 ## 本地开发（不使用 Docker）
 
@@ -946,7 +1086,8 @@ app/
   reviser.py    # 人工校订：沿逐字来源定位校订并落实改字 + 合并/冲突/定位判定
   locator.py    # 引文定位：半全局编辑代价 DP 查拼接文本区间；多引文按序不重叠最优链 + 并列/无完整链判定
   repetition.py # 重复抄写发现：对角扫描兼容 run + 滑动窗口取最长/已知相同位最多的非重叠等长区间对
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition）
+  omission.py   # 脱漏审计：段间接缝枚举 + 参照稿连续缺文补入后逐位异字数（前/后缀和）择优与并列判定
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml

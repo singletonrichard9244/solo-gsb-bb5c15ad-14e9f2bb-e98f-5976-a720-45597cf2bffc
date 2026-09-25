@@ -756,3 +756,175 @@ def test_find_repetition_reuses_assemble_segment_limits():
     assert client.post(
         "/api/find-repetition", json={"segments": ["abc", ""]}
     ).status_code == 422
+
+
+def test_audit_omission_endpoint_unique_scheme():
+    resp = client.post(
+        "/api/audit-omission",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "甲乙丙丁戊己X庚辛",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "甲乙丙丁戊己庚辛"
+    assert data["reference"] == "甲乙丙丁戊己X庚辛"
+    assert data["pos"] == 6
+    assert data["missing"] == "X"
+    assert data["diff"] == 0
+    assert data["left"] == {
+        "char": "己",
+        "sources": [
+            {"segment": 0, "pos": 5},
+            {"segment": 1, "pos": 1},
+        ],
+    }
+    assert data["right"] == {
+        "char": "庚",
+        "sources": [{"segment": 1, "pos": 2}],
+    }
+    # 拼接文本与 /api/assemble 一致，接口不改写
+    assert data["text"] == client.post(
+        "/api/assemble", json={"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    ).json()["text"]
+
+
+def test_audit_omission_multi_char_missing_and_diff():
+    # 缺文 3 字；另带 1 个已知异字 -> diff 1
+    resp = client.post(
+        "/api/audit-omission",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "子乙丙丁戊己XYZ庚辛",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["pos"] == 6
+    assert data["missing"] == "XYZ"
+    assert data["diff"] == 1
+
+
+def test_audit_omission_wildcard_costs_zero():
+    resp = client.post(
+        "/api/audit-omission",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "?乙丙丁戊己X庚?",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["diff"] == 0
+
+
+def test_audit_omission_tie_returns_409():
+    # text=AXCD，参照 AXCCD：接缝 2（X|C）、3（C|D）补 C 均 0 异字
+    resp = client.post(
+        "/api/audit-omission",
+        json={"segments": ["AX", "AXC", "XCD"], "reference": "AXCCD"},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["diff"] == 0
+    assert [t["pos"] for t in detail["ties"]] == [2, 3]
+    for t in detail["ties"]:
+        assert t["missing"] == "C" and t["diff"] == 0
+        assert t["left"]["char"] and t["right"]["char"]
+        assert len(t["left"]["sources"]) >= 1
+        assert len(t["right"]["sources"]) >= 1
+
+
+def test_audit_omission_no_scheme_returns_422():
+    # 参照与拼接稿字表完全不相交：任一接缝补入后异字数都超过 2
+    resp = client.post(
+        "/api/audit-omission",
+        json={"segments": ["AX", "AXC", "XCD"], "reference": "子子子子子"},
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+
+def test_audit_omission_no_seam_returns_422():
+    # 两段完全重叠：拼接文本无段间接缝
+    resp = client.post(
+        "/api/audit-omission",
+        json={"segments": ["甲乙丙", "甲乙丙"], "reference": "甲乙丙X"},
+    )
+    assert resp.status_code == 422
+    assert "接缝" in resp.json()["detail"]["message"]
+
+
+def test_audit_omission_length_gap_validated():
+    base = {"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    # 等长（多 0 字）/ 参照更短 / 多 41 字
+    assert client.post(
+        "/api/audit-omission", json={**base, "reference": "甲乙丙丁戊己庚辛"}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission", json={**base, "reference": "甲乙丙丁戊己庚"}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission",
+        json={**base, "reference": "甲乙丙丁戊己" + "X" * 41 + "庚辛"},
+    ).status_code == 422
+
+
+def test_audit_omission_reference_limits_validated():
+    base = {"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    # 缺 reference / 空 reference / 超 840 字
+    assert client.post("/api/audit-omission", json=base).status_code == 422
+    assert client.post(
+        "/api/audit-omission", json={**base, "reference": ""}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission", json={**base, "reference": "字" * 841}
+    ).status_code == 422
+    # 恰好 840 字可通过参数校验（长度差是否合格不影响 422 校验语义；
+    # 该拼接仅 8 字，差 832 字 -> 语义 422）
+    resp = client.post(
+        "/api/audit-omission", json={**base, "reference": "字" * 840}
+    )
+    assert resp.status_code == 422
+
+
+def test_audit_omission_reuses_assemble_segment_limits():
+    body = {"reference": "甲乙丙丁戊己X庚辛"}
+    # 段数不足 / 超上限
+    assert client.post(
+        "/api/audit-omission", json={"segments": ["abc"], **body}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"], **body},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/audit-omission",
+        json={"segments": ["a" * 500, "b" * 501], "reference": "a" * 9},
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission",
+        json={"segments": ["字" * 400, "字" * 401], "reference": "字" * 9},
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-omission",
+        json={"segments": ["abc", ""], **body},
+    ).status_code == 422
+
+
+def test_audit_omission_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/audit-omission",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "reference": "孔子曰未知生焉X",
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_audit_omission_index_lists_endpoint():
+    info = client.get("/").json()
+    assert info["audit_omission"] == "POST /api/audit-omission"

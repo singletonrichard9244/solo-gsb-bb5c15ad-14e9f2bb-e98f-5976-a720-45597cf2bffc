@@ -26,6 +26,13 @@
   重叠的等长连续区间（逐字相同或任一字为 ``?`` 即兼容，长度至少 6、至少
   4 个已知相同位），按长度、已知相同位、起点排序取首对；无合格重复时
   repeat 为 null。
+- ``POST /api/audit-omission``：提交与 ``/api/assemble`` 相同的有序
+  segments 及一段独立参照转写 reference（最长 840 字），复用其拼接文本和
+  逐字来源，只在“左字含某原始段、右字不含该段而含更晚原始段”的相邻接缝
+  处，枚举补入参照稿连续缺文（参照稿须恰好多 1～40 字）后两稿逐位对齐
+  （相同字或任一侧 ``?`` 记 0、已知异字记 1，整稿最多 2）的方案；唯一
+  方案返回插入位置、缺文、异字数与接缝两侧 sources，不同缺文位置并列返回
+  409，无合格方案返回 422。结果仅供人工复核，不改写拼接稿。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -64,6 +71,15 @@ from .orderer import (
     MIN_SEGMENTS as ORDER_MIN_SEGMENTS,
 )
 from .orderer import NoCompleteOrderError, OrderTieError, determine_order
+from .omission import (
+    MAX_REFERENCE_LEN as AUDIT_MAX_REFERENCE_LEN,
+)
+from .omission import (
+    OmissionNotFoundError,
+    OmissionRequirementError,
+    OmissionTieError,
+    audit_omission,
+)
 from .repetition import find_repetition
 from .reviser import EditConflictError, EditLocationError, revise
 
@@ -443,6 +459,49 @@ class FindRepetitionResponse(BaseModel):
     )
 
 
+class AuditOmissionRequest(AssembleRequest):
+    """脱漏审计请求：与 /api/assemble 相同的有序 segments，外加独立参照转写。"""
+
+    reference: str = Field(
+        ...,
+        min_length=1,
+        max_length=AUDIT_MAX_REFERENCE_LEN,
+        description="独立参照转写（1～840 字），须比拼接文本恰好多 1～40 字；"
+                    "未辨认字以 ? 表示，可与拼接文本中的 ? 免异字配对",
+        examples=["学而时习之温故而知新不亦乐乎"],
+    )
+
+
+class SeamSide(BaseModel):
+    """接缝一侧的相邻字及其逐字来源。"""
+
+    char: str = Field(..., description="该侧相邻的拼接文本字（接缝位于 left.char 与 right.char 之间）")
+    sources: list[CharSource] = Field(
+        ...,
+        description="该字的逐字来源列表，规则与 /api/assemble 一致",
+    )
+
+
+class OmissionScheme(BaseModel):
+    """一个接缝补字方案。"""
+
+    pos: int = Field(
+        ...,
+        description="缺文插入位置（拼接文本下标，从 0 开始）：补在 text[pos-1] 与 text[pos] 之间",
+    )
+    missing: str = Field(..., description="建议补入的参照稿连续缺文字串（1～40 字）")
+    diff: int = Field(..., description="补入后两稿逐位对齐的异字数（最多 2）")
+    left: SeamSide = Field(..., description="接缝左侧相邻字（text[pos-1]）及其逐字 sources")
+    right: SeamSide = Field(..., description="接缝右侧相邻字（text[pos]）及其逐字 sources")
+
+
+class AuditOmissionResponse(OmissionScheme):
+    """唯一脱漏方案时的审计结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    reference: str = Field(..., description="原样回显的独立参照转写")
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -455,6 +514,7 @@ def index():
         "locate_quote": "POST /api/locate-quote",
         "locate_quotes": "POST /api/locate-quotes",
         "find_repetition": "POST /api/find-repetition",
+        "audit_omission": "POST /api/audit-omission",
         "docs": "/docs",
         "health": "/health",
     }
@@ -926,5 +986,98 @@ def api_find_repetition(req: AssembleRequest):
             detail={
                 "message": str(exc),
                 "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/audit-omission",
+    response_model=AuditOmissionResponse,
+    status_code=200,
+    summary="在段间接缝处比对参照转写，审计拼接稿可能的连续脱漏",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "另附一段**独立参照转写** `reference`（1～840 字）。接口先复用其拼接"
+        "得到拼接文本与逐字来源，再只检查相邻两字之间的**段间接缝**：左字的"
+        "来源中含某原始段、右字的来源中不含该段而含**更晚的原始段**。参照稿须"
+        "比拼接稿**恰好多 1～40 字**，否则返回 **422**。对每条接缝枚举：把参照稿"
+        "中与多出字数等长的**连续缺文** `reference[r:r+gap]` 补入该接缝，两稿即"
+        "等长，逐位对齐计分——相同字、或任一侧为 `?` 记 **0**，双方已知且异字"
+        "记 **1**；仅接受整稿异字数不超过 **2** 的方案。取异字数最少者："
+        "**唯一接缝**命中时返回插入位置 `pos`（补在 `text[pos-1]` 与 `text[pos]` "
+        "之间）、缺文字串 `missing`、异字数 `diff` 及接缝两侧相邻字与逐字 "
+        "sources；**多个不同接缝（不同缺文位置）**以同一最少异字数并列时返回 "
+        "**409**（按位置升序列出全部并列方案）；无接缝或所有接缝异字数均超过 2 "
+        "时返回 **422**。同一接缝若有多段参照片段异字数相同，取参照起点最先者"
+        "（缺文位置相同，不构成并列）。结果**仅供人工复核，不改写拼接稿**。"
+    ),
+    responses={
+        409: {
+            "description": "最少异字数由多个不同接缝（不同缺文位置）并列取得",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "参照稿的连续缺文可补入 2 个不同接缝且最少异字数同为 1，无法唯一确定缺文位置",
+                            "diff": 1,
+                            "ties": [
+                                {
+                                    "pos": 5,
+                                    "missing": "壬",
+                                    "diff": 1,
+                                    "left": {"char": "戊", "sources": [{"segment": 0, "pos": 4}]},
+                                    "right": {"char": "己", "sources": [{"segment": 1, "pos": 0}]},
+                                },
+                                {
+                                    "pos": 9,
+                                    "missing": "壬",
+                                    "diff": 1,
+                                    "left": {"char": "辛", "sources": [{"segment": 1, "pos": 3}]},
+                                    "right": {"char": "壬", "sources": [{"segment": 2, "pos": 0}]},
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "续接失败、参照长度前提不满足，或无合格脱漏方案",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "全部 2 个段间接缝补入参照稿连续缺文后，整稿异字数均超过 2，无合格脱漏方案"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_audit_omission(req: AuditOmissionRequest):
+    try:
+        return audit_omission(req.segments, req.reference)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except (OmissionRequirementError, OmissionNotFoundError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+    except OmissionTieError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "diff": exc.diff,
+                "ties": exc.ties,
             },
         ) from exc
